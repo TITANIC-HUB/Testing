@@ -1,5 +1,4 @@
-
--- ============================================================
+==========================================================
 -- SERVICES
 -- ============================================================
 local Players = game:GetService("Players")
@@ -27,7 +26,7 @@ end)
 
 local Window = Library:CreateWindow({
     Title = "Proximity Lock",
-    Footer = "by L | discord: introvertt_l",
+    Footer = "by @L | discord: introvertt_l",
     Center = true,
     AutoShow = true,
     Resizable = true,
@@ -36,6 +35,7 @@ local Window = Library:CreateWindow({
 
 local Tabs = {
     Main = Window:AddTab("Main", "crosshair"),
+    Info = Window:AddTab("Info", "info"),
     Settings = Window:AddTab("Settings", "settings"),
     Configs = Window:AddTab("Configs", "settings-2"),
 }
@@ -49,6 +49,7 @@ local Settings = {
     Smoothness = 0.2,
     TargetPart = "HumanoidRootPart",
     TeamCheck = false,
+    AimCone = 15,
 }
 
 -- ============================================================
@@ -58,40 +59,48 @@ local state = {
     bound = false,
     toggleConn = nil,
     currentTarget = nil,
+    lockedTarget = nil,
+    lockStartTime = nil,
+    lockCount = 0,
 }
 
 -- ============================================================
--- CORE: FIND NEAREST PLAYER
+-- CORE: FIND PLAYER UNDER CROSSHAIR
 -- ============================================================
-local function GetNearestPlayer()
-    local target = nil
-    local shortestDistance = math.huge
+local function GetPlayerUnderCrosshair()
+    local closest = nil
+    local shortestAngle = math.rad(Settings.AimCone)
+
+    local camPos = Camera.CFrame.Position
+    local camLook = Camera.CFrame.LookVector
 
     for _, player in pairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Character then
             local root = player.Character:FindFirstChild(Settings.TargetPart)
             local hum = player.Character:FindFirstChild("Humanoid")
-            local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 
-            if root and hum and hum.Health > 0 and myRoot then
+            if root and hum and hum.Health > 0 then
                 local skip = false
                 if Settings.TeamCheck and player.Team == LocalPlayer.Team then
                     skip = true
                 end
 
                 if not skip then
-                    local distance = (myRoot.Position - root.Position).Magnitude
-                    local _, isVisible = Camera:WorldToViewportPoint(root.Position)
+                    local dirToPlayer = (root.Position - camPos).Unit
+                    local angle = math.acos(math.clamp(camLook:Dot(dirToPlayer), -1, 1))
 
-                    if isVisible and distance < shortestDistance then
-                        target = root
-                        shortestDistance = distance
+                    local _, onScreen = Camera:WorldToViewportPoint(root.Position)
+
+                    if onScreen and angle < shortestAngle then
+                        closest = root
+                        shortestAngle = angle
                     end
                 end
             end
         end
     end
-    return target
+
+    return closest
 end
 
 -- ============================================================
@@ -99,15 +108,37 @@ end
 -- ============================================================
 local function proximityLoop()
     if not Settings.LockEnabled then
-        state.currentTarget = nil
         return
     end
 
-    local target = GetNearestPlayer()
-    state.currentTarget = target
-
+    local target = state.lockedTarget
     if target then
-        local targetCFrame = CFrame.lookAt(Camera.CFrame.Position, target.Position)
+        local parent = target.Parent
+        local hum = parent and parent:FindFirstChild("Humanoid")
+
+        if not parent or not hum or hum.Health <= 0 then
+            state.lockedTarget = nil
+            state.currentTarget = nil
+            Settings.LockEnabled = false
+            state.lockStartTime = nil
+
+            pcall(function()
+                if Toggles.LockEnabled then Toggles.LockEnabled:SetValue(false) end
+            end)
+
+            Library:Notify({
+                Title = "Proximity Lock",
+                Description = "Target lost — unlocked",
+                Time = 2,
+            })
+            return
+        end
+    end
+
+    state.currentTarget = state.lockedTarget
+
+    if state.lockedTarget then
+        local targetCFrame = CFrame.lookAt(Camera.CFrame.Position, state.lockedTarget.Position)
         Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, Settings.Smoothness)
     end
 end
@@ -135,16 +166,48 @@ local function bindToggleKey()
     end
 
     state.toggleConn = UserInputService.InputBegan:Connect(function(input, processed)
-        if not processed and input.KeyCode == Settings.ToggleKey then
-            Settings.LockEnabled = not Settings.LockEnabled
+        if processed then return end
+        if input.KeyCode ~= Settings.ToggleKey then return end
+
+        if Settings.LockEnabled then
+            Settings.LockEnabled = false
+            state.lockedTarget = nil
+            state.currentTarget = nil
+            state.lockStartTime = nil
+
             pcall(function()
-                if Toggles.LockEnabled then Toggles.LockEnabled:SetValue(Settings.LockEnabled) end
+                if Toggles.LockEnabled then Toggles.LockEnabled:SetValue(false) end
             end)
+
             Library:Notify({
                 Title = "Proximity Lock",
-                Description = Settings.LockEnabled and "Enabled" or "Disabled",
+                Description = "Unlocked",
                 Time = 2,
             })
+        else
+            local target = GetPlayerUnderCrosshair()
+            if target then
+                Settings.LockEnabled = true
+                state.lockedTarget = target
+                state.lockStartTime = tick()
+                state.lockCount = state.lockCount + 1
+
+                pcall(function()
+                    if Toggles.LockEnabled then Toggles.LockEnabled:SetValue(true) end
+                end)
+
+                Library:Notify({
+                    Title = "Proximity Lock",
+                    Description = "Locked onto " .. target.Parent.Name,
+                    Time = 2,
+                })
+            else
+                Library:Notify({
+                    Title = "Proximity Lock",
+                    Description = "No player under crosshair",
+                    Time = 2,
+                })
+            end
         end
     end)
 end
@@ -158,10 +221,33 @@ local InfoGroup = Tabs.Main:AddRightGroupbox("Status", "activity")
 LockGroup:AddToggle("LockEnabled", {
     Text = "Enable Lock",
     Default = false,
-    Tooltip = "Locks camera onto nearest visible player",
+    Tooltip = "Locks camera onto the player you were aiming at",
 })
 Toggles.LockEnabled:OnChanged(function(v)
-    Settings.LockEnabled = v
+    if v then
+        local target = GetPlayerUnderCrosshair()
+        if target then
+            Settings.LockEnabled = true
+            state.lockedTarget = target
+            state.lockStartTime = tick()
+            state.lockCount = state.lockCount + 1
+        else
+            Settings.LockEnabled = false
+            task.defer(function()
+                pcall(function() Toggles.LockEnabled:SetValue(false) end)
+            end)
+            Library:Notify({
+                Title = "Proximity Lock",
+                Description = "No player under crosshair",
+                Time = 2,
+            })
+        end
+    else
+        Settings.LockEnabled = false
+        state.lockedTarget = nil
+        state.currentTarget = nil
+        state.lockStartTime = nil
+    end
 end)
 
 LockGroup:AddSlider("Smoothness", {
@@ -175,6 +261,19 @@ LockGroup:AddSlider("Smoothness", {
 })
 Options.Smoothness:OnChanged(function(v)
     Settings.Smoothness = tonumber(v) or 0.2
+end)
+
+LockGroup:AddSlider("AimCone", {
+    Text = "Aim Cone (degrees)",
+    Min = 3,
+    Max = 45,
+    Default = 15,
+    Rounding = 0,
+    Suffix = "°",
+    Tooltip = "How close to the crosshair a player must be to be picked",
+})
+Options.AimCone:OnChanged(function(v)
+    Settings.AimCone = tonumber(v) or 15
 end)
 
 LockGroup:AddDropdown("TargetPart", {
@@ -207,6 +306,7 @@ task.spawn(function()
             else
                 statusLabel:SetText("Status: Idle")
             end
+
             if state.currentTarget and state.currentTarget.Parent then
                 local name = state.currentTarget.Parent.Name
                 targetLabel:SetText("Target: " .. name)
@@ -216,6 +316,98 @@ task.spawn(function()
         end)
     end
 end)
+
+-- ============================================================
+-- INFO TAB
+-- ============================================================
+local HowToGroup = Tabs.Info:AddLeftGroupbox("How To Use", "book-open")
+local TipsGroup  = Tabs.Info:AddRightGroupbox("Tips & Tricks", "lightbulb")
+local LiveGroup  = Tabs.Info:AddLeftGroupbox("Live Info", "activity")
+local CreditGroup = Tabs.Info:AddRightGroupbox("Credits", "heart")
+
+HowToGroup:AddLabel(
+    "<b>1.</b> Look at the player you want to lock onto\n" ..
+    "<b>2.</b> Press your keybind (default: <font color=\"#6464FF\">C</font>)\n" ..
+    "<b>3.</b> Camera locks onto them\n" ..
+    "<b>4.</b> Press the keybind again to unlock\n" ..
+    "<b>5.</b> Aim at a different player and press again to switch"
+)
+
+HowToGroup:AddDivider()
+HowToGroup:AddLabel(
+    "<b>Auto-Unlock:</b> If your target dies, leaves, or respawns, " ..
+    "the lock automatically turns off."
+)
+
+TipsGroup:AddLabel(
+    "• Increase <b>Aim Cone</b> if you're missing targets\n" ..
+    "• Lower <b>Smoothness</b> for cinematic tracking\n" ..
+    "• Set <b>Smoothness</b> to 1 for instant snap (rage)\n" ..
+    "• Use <b>Head</b> as target part for precise aim\n" ..
+    "• Use <b>HumanoidRootPart</b> for smoother tracking\n" ..
+    "• Enable <b>Team Check</b> in team games"
+)
+
+LiveGroup:AddLabel("Toggle Key: <font color=\"#6464FF\">" .. Settings.ToggleKey.Name .. "</font>")
+local liveStatus = LiveGroup:AddLabel("Current Status: Idle")
+local liveTarget = LiveGroup:AddLabel("Locked Target: None")
+local liveTime   = LiveGroup:AddLabel("Lock Duration: 0.0s")
+local liveCount  = LiveGroup:AddLabel("Total Locks: 0")
+
+task.spawn(function()
+    while true do
+        task.wait(0.25)
+        pcall(function()
+            -- Live status
+            if Settings.LockEnabled then
+                liveStatus:SetText("Current Status: <font color=\"#00FF00\">Locked</font>")
+            else
+                liveStatus:SetText("Current Status: <font color=\"#FF6464\">Idle</font>")
+            end
+
+            -- Target
+            if state.currentTarget and state.currentTarget.Parent then
+                liveTarget:SetText("Locked Target: <font color=\"#6464FF\">" .. state.currentTarget.Parent.Name .. "</font>")
+            else
+                liveTarget:SetText("Locked Target: None")
+            end
+
+            -- Duration
+            if state.lockStartTime and Settings.LockEnabled then
+                liveTime:SetText(string.format("Lock Duration: %.1fs", tick() - state.lockStartTime))
+            else
+                liveTime:SetText("Lock Duration: 0.0s")
+            end
+
+            -- Count
+            liveCount:SetText("Total Locks: " .. tostring(state.lockCount))
+        end)
+    end
+end)
+
+CreditGroup:AddLabel(
+    "<b>Proximity Lock</b>\n" ..
+    "Made with <font color=\"#FF6464\">♥</font> using Obsidian UI\n\n" ..
+    "Discord: <font color=\"#6464FF\">introvertt_l</font>"
+)
+CreditGroup:AddDivider()
+CreditGroup:AddLabel(
+    "<i>Found a bug? DM me on Discord and I'll fix it!</i>"
+)
+
+CreditGroup:AddButton({
+    Text = "Copy Discord Tag",
+    Func = function()
+        if setclipboard then
+            setclipboard("introvertt_l")
+            Library:Notify({
+                Title = "Copied!",
+                Description = "Discord tag copied to clipboard",
+                Time = 2,
+            })
+        end
+    end,
+})
 
 -- ============================================================
 -- SETTINGS TAB
@@ -236,7 +428,7 @@ Options.ToggleKey:OnChanged(function(v)
     end
 end)
 
-KeyGroup:AddLabel("Press keybind to toggle lock on/off")
+KeyGroup:AddLabel("Aim at a player and press the keybind to lock/unlock")
 
 -- ============================================================
 -- THEME + SAVE MANAGERS
@@ -279,6 +471,6 @@ bindToggleKey()
 
 Library:Notify({
     Title = "Proximity Lock",
-    Description = "Loaded! Press " .. Settings.ToggleKey.Name .. " to toggle",
+    Description = "Aim at a player and press " .. Settings.ToggleKey.Name .. " to lock",
     Time = 4,
 })
